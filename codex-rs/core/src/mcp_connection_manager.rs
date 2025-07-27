@@ -28,6 +28,28 @@ use crate::config_types::McpServerConfig;
 /// choose a delimiter from this character set.
 const MCP_TOOL_NAME_DELIMITER: &str = "__OAI_CODEX_MCP__";
 
+/// Validate that an identifier only contains alphanumeric characters, `-` or
+/// `_` and is non-empty.
+fn is_valid_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn sanitize_tool_name(name: &str) -> String {
+    name.replace(MCP_TOOL_NAME_DELIMITER, "_")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Timeout for the `tools/list` request.
 const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -79,9 +101,17 @@ impl McpConnectionManager {
 
         // Launch all configured servers concurrently.
         let mut join_set = JoinSet::new();
+        let mut errors = ClientStartErrors::new();
 
         for (server_name, cfg) in mcp_servers {
-            // TODO: Verify server name: require `^[a-zA-Z0-9_-]+$`?
+            if !is_valid_identifier(&server_name) {
+                errors.insert(
+                    server_name,
+                    anyhow!("invalid server name; expected ^[a-zA-Z0-9_-]+$"),
+                );
+                continue;
+            }
+
             join_set.spawn(async move {
                 let McpServerConfig { command, args, env } = cfg;
                 let client_res = McpClient::new_stdio_client(command, args, env).await;
@@ -117,7 +147,6 @@ impl McpConnectionManager {
 
         let mut clients: HashMap<String, std::sync::Arc<McpClient>> =
             HashMap::with_capacity(join_set.len());
-        let mut errors = ClientStartErrors::new();
 
         while let Some(res) = join_set.join_next().await {
             let (server_name, client_res) = res?; // JoinError propagation
@@ -157,8 +186,15 @@ impl McpConnectionManager {
             .ok_or_else(|| anyhow!("unknown MCP server '{server}'"))?
             .clone();
 
+        let fq = fully_qualified_tool_name(server, tool);
+        let original_name = self
+            .tools
+            .get(&fq)
+            .map(|t| t.name.clone())
+            .ok_or_else(|| anyhow!("unknown tool '{server}/{tool}'"))?;
+
         client
-            .call_tool(tool.to_string(), arguments, timeout)
+            .call_tool(original_name, arguments, timeout)
             .await
             .with_context(|| format!("tool call failed for `{server}/{tool}`"))
     }
@@ -192,8 +228,8 @@ pub async fn list_all_tools(
         let list_result = list_result?;
 
         for tool in list_result.tools {
-            // TODO(mbolin): escape tool names that contain invalid characters.
-            let fq_name = fully_qualified_tool_name(&server_name, &tool.name);
+            let sanitized = sanitize_tool_name(&tool.name);
+            let fq_name = fully_qualified_tool_name(&server_name, &sanitized);
             if aggregated.insert(fq_name.clone(), tool).is_some() {
                 panic!("tool name collision for '{fq_name}': suspicious");
             }
@@ -207,4 +243,30 @@ pub async fn list_all_tools(
     );
 
     Ok(aggregated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_identifier_examples() {
+        for name in ["server1", "S2_er-3", "a_b-c"] {
+            assert!(is_valid_identifier(name), "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn invalid_identifier_examples() {
+        for name in ["", "bad name", "foo/bar", "foo!"] {
+            assert!(!is_valid_identifier(name), "{name:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn sanitize_tool_name_rewrites_invalid_chars() {
+        let raw = format!("bad{}name/!", MCP_TOOL_NAME_DELIMITER);
+        let sanitized = sanitize_tool_name(&raw);
+        assert_eq!(sanitized, "bad_name__");
+    }
 }
