@@ -1509,7 +1509,13 @@ async fn apply_patch(
     let mut stderr = Vec::new();
     // Enforce writable roots. If a write is blocked, collect offending root
     // and prompt the user to extend permissions.
-    let mut result = apply_changes_from_apply_patch_and_report(&action, &mut stdout, &mut stderr);
+    let mut result = apply_changes_from_apply_patch_and_report(
+        &action,
+        &sess.sandbox_policy,
+        &sess.cwd,
+        &mut stdout,
+        &mut stderr,
+    );
 
     if let Err(err) = &result {
         if err.kind() == std::io::ErrorKind::PermissionDenied {
@@ -1572,6 +1578,8 @@ async fn apply_patch(
                     stderr.clear();
                     result = apply_changes_from_apply_patch_and_report(
                         &action,
+                        &sess.sandbox_policy,
+                        &sess.cwd,
                         &mut stdout,
                         &mut stderr,
                     );
@@ -1680,10 +1688,12 @@ fn convert_apply_patch_to_protocol(action: &ApplyPatchAction) -> HashMap<PathBuf
 
 fn apply_changes_from_apply_patch_and_report(
     action: &ApplyPatchAction,
+    sandbox_policy: &crate::protocol::SandboxPolicy,
+    cwd: &std::path::Path,
     stdout: &mut impl std::io::Write,
     stderr: &mut impl std::io::Write,
 ) -> std::io::Result<()> {
-    match apply_changes_from_apply_patch(action) {
+    match apply_patch_with_sandbox(action, sandbox_policy, cwd) {
         Ok(affected_paths) => {
             print_summary(&affected_paths, stdout)?;
         }
@@ -1755,6 +1765,24 @@ fn apply_changes_from_apply_patch(action: &ApplyPatchAction) -> anyhow::Result<A
         modified,
         deleted,
     })
+}
+
+pub fn apply_patch_with_sandbox(
+    action: &codex_apply_patch::ApplyPatchAction,
+    sandbox_policy: &crate::protocol::SandboxPolicy,
+    cwd: &std::path::Path,
+) -> anyhow::Result<codex_apply_patch::AffectedPaths> {
+    if !sandbox_policy.has_full_disk_write_access() {
+        let roots = sandbox_policy.get_writable_roots_with_cwd(cwd);
+        if let Some(offending) = first_offending_path(action, &roots, cwd) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("write to {} not allowed by sandbox", offending.display()),
+            )
+            .into());
+        }
+    }
+    apply_changes_from_apply_patch(action)
 }
 
 fn get_writable_roots(cwd: &Path) -> Vec<std::path::PathBuf> {
